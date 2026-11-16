@@ -1,0 +1,904 @@
+desc:HatsOff - Hi-Hat Pattern Sampler
+//tags: instrument sampler sequencer generator hi-hat
+//author: Ireground
+//
+// Drop a short sample (hi-hat) on the window, generate or draw a pattern,
+// and HatsOff plays it in sync with REAPER (or free-running with RUN).
+// The pattern is also sent out as MIDI, and can be printed to a MIDI item
+// with the companion script "HatsOff - Pattern to MIDI item.lua".
+
+slider1:run=0<0,1,1{Off,On}>-Run (free)
+slider2:seq=1<0,1,1{Off,On}>-Sequencer
+slider3:nsteps=16<1,32,1>-Steps
+slider4:rate=3<0,5,1{1/4,1/8,1/8T,1/16,1/16T,1/32}>-Rate
+slider5:swing=0<0,100,1>-Swing (%)
+slider6:tune=0<-24,24,0.01>-Tune (st)
+slider7:decay=100<5,100,1>-Decay (%)
+slider8:vol=0<-36,6,0.1>-Volume (dB)
+slider9:density=50<0,100,1>-Density (%)
+slider10:variation=40<0,100,1>-Velocity variation (%)
+slider11:rolls=20<0,100,1>-Rolls (%)
+slider12:note=42<0,127,1>-MIDI note
+slider13:midiout=1<0,1,1{Off,On}>-MIDI out
+slider14:choke=1<0,1,1{Off,On}>-Choke
+slider15:embed=1<0,1,1{Off,On}>-Embed sample in project
+slider16:patver=0<0,1000000,1>-Pattern version
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+options:maxmem=8388608
+options:gmem=HatsOff
+
+@init
+ext_noinit = 1;
+
+// ---------- memory map ----------
+PON  = 0;    PVEL = 32;  PRAT = 64;     // pattern (contiguous, 96 slots)
+UON  = 128;  UVEL = 160; URAT = 192;    // undo copy
+TV   = 256;  TR   = 300;                // temp
+PK   = 400;  NPK  = 512;                // waveform peaks
+Q    = 1000; QMAX = 500;                // hit queue: ofs, vel, len, src
+OQ   = 4000; OQMAX = 1000;              // midi out queue: ofs, m1, m2, m3
+VOI  = 9000; NV = 8;                    // voices, stride 8
+SMP  = 10000; MAXF = 4000000;           // sample data (interleaved)
+
+// ---------- colours (light scheme) ----------
+C_BG    = 0x141414;
+C_PANEL = 0xE4E4E1;
+C_INSET = 0xC9C9C5;
+C_INSET2= 0xBBBBB7;
+C_LABEL = 0x5C5C59;
+C_TEXT  = 0x1C1C1A;
+C_TRACK = 0xB4B4B0;
+C_OR    = 0xEF5C25;
+C_ORL   = 0xF6D5C7;
+C_BL    = 0x3960B6;
+C_TE    = 0x2D908B;
+C_PU    = 0x8A4AB8;
+C_PUL   = 0xCDB8E0;
+C_GR    = 0x23955F;
+C_GRL   = 0xC3E3D1;
+C_GRH   = 0x3DB97D;
+C_RED   = 0xD23B2E;
+C_WHITE = 0xFFFFFF;
+
+has_smp = 0; smp_frames = 0; smp_nch = 1; smp_sr = 44100;
+need_load = 0; need_peaks = 0; load_err_t = -100;
+has_undo = 0; lastv = 0; vrr = 0;
+pend_off = 0; pend_ofs = 0; pend_note = 42;
+freepos = 0; was_run = 0; prev_b1 = -1000; was_tplay = 0;
+disp_step = -1; disp_play = 0;
+act = 0; last_cap = 0; lastclick_t = 0; lastclick_id = -1;
+
+// default pattern: straight 8ths with accents
+i = 0;
+loop(32,
+  PON[i] = (i % 2) == 0;
+  PVEL[i] = (i % 4) == 0 ? 110 : 88;
+  PRAT[i] = 1;
+  i += 1;
+);
+memset(VOI, 0, NV*8);
+
+// ---------- helpers ----------
+function steplen_of(r)
+(
+  r == 0 ? 1 : (r == 1 ? 0.5 : (r == 2 ? 1/3 : (r == 3 ? 0.25 : (r == 4 ? 1/6 : 0.125))));
+);
+
+function cls_of(s) local(ph)
+(
+  ph = s * steplen_of(rate);
+  ph -= floor(ph + 0.0001);
+  abs(ph) < 0.001 ? 0 : (abs(ph - 0.5) < 0.001 ? 1 : 2);
+);
+
+function wcls(s) ( cls_of(s) == 0 ? 3 : (cls_of(s) == 1 ? 2 : 1); );
+
+function publish() local(i)
+(
+  gmem[0] = 1;
+  gmem[1] = nsteps;
+  gmem[2] = steplen_of(rate);
+  gmem[3] = swing;
+  gmem[4] = note;
+  gmem[5] += 1;
+  i = 0;
+  loop(32,
+    gmem[10 + i*3] = PON[i];
+    gmem[11 + i*3] = PVEL[i];
+    gmem[12 + i*3] = PRAT[i];
+    i += 1;
+  );
+);
+
+function pat_changed()
+(
+  publish();
+  patver = patver >= 1000000 ? 0 : patver + 1;
+  sliderchange(2^15);
+);
+
+function snapshot()
+(
+  memcpy(UON, PON, 96);
+  has_undo = 1;
+);
+
+function do_undo()
+(
+  has_undo ? (
+    memcpy(TV, PON, 96);       // TV..TV+95 used as swap space (TR follows)
+    memcpy(PON, UON, 96);
+    memcpy(UON, TV, 96);
+    pat_changed();
+  );
+);
+
+function gen_vel(cls) local(v)
+(
+  v = cls == 0 ? 110 : (cls == 1 ? 95 : 74);
+  v += (rand(2) - 1) * variation / 100 * 35;
+  floor(max(15, min(127, v)) + 0.5);
+);
+
+function roll_value() local(r)
+(
+  r = rand(1);
+  r < 0.5 ? 2 : (r < 0.8 ? 3 : 4);
+);
+
+function generate_raw() local(s, d, p, cls, pr)
+(
+  d = density / 100;
+  s = 0;
+  loop(32, PON[s] = 0; PRAT[s] = 1; s += 1;);
+  s = 0;
+  loop(nsteps,
+    cls = cls_of(s);
+    p = cls == 0 ? min(1, 0.55 + 0.9*d) : (cls == 1 ? min(1, 0.4 + 0.9*d) : 0.95 * d^1.3);
+    rand(1) < p ? (
+      PON[s] = 1;
+      PVEL[s] = gen_vel(cls);
+      pr = rolls / 100 * 0.3;
+      s >= nsteps - 2 ? pr += rolls / 100 * 0.3;
+      rand(1) < pr ? (
+        PRAT[s] = roll_value();
+        PVEL[s] = max(15, PVEL[s] - 10);
+      );
+    );
+    s += 1;
+  );
+);
+
+function rand_notes_raw() local(s, k, j, tot, x, found)
+(
+  k = 0; s = 0;
+  loop(nsteps, PON[s] ? ( TV[k] = PVEL[s]; TR[k] = PRAT[s]; k += 1; ); s += 1;);
+  k == 0 ? generate_raw() : (
+    s = 0; loop(32, PON[s] = 0; PRAT[s] = 1; s += 1;);
+    j = 0;
+    loop(k,
+      tot = 0; s = 0;
+      loop(nsteps, !PON[s] ? tot += wcls(s); s += 1;);
+      x = rand(tot); found = -1; s = 0;
+      loop(nsteps,
+        found < 0 && !PON[s] ? ( x -= wcls(s); x < 0 ? found = s; );
+        s += 1;
+      );
+      found < 0 ? ( s = 0; loop(nsteps, found < 0 && !PON[s] ? found = s; s += 1;); );
+      found >= 0 ? PON[found] = 1;
+      j += 1;
+    );
+    j = 0; s = 0;
+    loop(nsteps, PON[s] ? ( PVEL[s] = TV[j]; PRAT[s] = TR[j]; j += 1; ); s += 1;);
+  );
+);
+
+function rand_vel_raw() local(s)
+(
+  s = 0;
+  loop(nsteps,
+    PON[s] ? (
+      PVEL[s] = gen_vel(cls_of(s));
+      PRAT[s] > 1 ? PVEL[s] = max(15, PVEL[s] - 10);
+    );
+    s += 1;
+  );
+);
+
+function do_generate()  ( snapshot(); generate_raw(); pat_changed(); );
+function do_rand_notes()( snapshot(); rand_notes_raw(); pat_changed(); );
+function do_rand_vel()  ( snapshot(); rand_vel_raw(); pat_changed(); );
+function do_rand_all()  ( snapshot(); rand_notes_raw(); rand_vel_raw(); pat_changed(); );
+function do_clear() local(s)
+(
+  snapshot();
+  s = 0; loop(32, PON[s] = 0; PRAT[s] = 1; s += 1;);
+  pat_changed();
+);
+
+// ---------- sample loading ----------
+function basename() local(i, c, p)
+(
+  p = -1; i = 0;
+  loop(strlen(#path),
+    c = str_getchar(#path, i);
+    (c == 47 || c == 92) ? p = i;
+    i += 1;
+  );
+  strcpy_substr(#fname, #path, p + 1);
+);
+
+function calc_peaks() local(b, s, e, m, j, x, mx)
+(
+  mx = 0; b = 0;
+  loop(NPK,
+    s = floor(b * smp_frames / NPK);
+    e = floor((b + 1) * smp_frames / NPK);
+    e <= s ? e = s + 1;
+    e > smp_frames ? e = smp_frames;
+    m = 0; j = s;
+    loop(max(0, e - s),
+      x = abs(SMP[j * smp_nch]);
+      smp_nch == 2 ? x = max(x, abs(SMP[j*2 + 1]));
+      m = max(m, x);
+      j += 1;
+    );
+    PK[b] = m;
+    mx = max(mx, m);
+    b += 1;
+  );
+  pk_max = mx > 0.00001 ? mx : 1;
+);
+
+function load_sample() local(h, nch, sr, n, fr, i)
+(
+  has_smp = 0;
+  memset(VOI, 0, NV*8);
+  h = file_open(#path);
+  h > 0 ? (
+    nch = 0; sr = 0;
+    file_riff(h, nch, sr);
+    nch >= 1 && sr > 0 ? (
+      n = file_avail(h);
+      n > MAXF ? n = MAXF;
+      n = floor(n / nch) * nch;
+      n > 0 ? (
+        file_mem(h, SMP, n);
+        fr = n / nch;
+        nch > 2 ? (
+          i = 0;
+          loop(fr, SMP[i*2] = SMP[i*nch]; SMP[i*2 + 1] = SMP[i*nch + 1]; i += 1;);
+          nch = 2;
+        );
+        smp_frames = fr; smp_nch = nch; smp_sr = sr;
+        calc_peaks();
+        has_smp = 1;
+      );
+    );
+    file_close(h);
+  );
+  basename();
+  !has_smp ? load_err_t = time_precise();
+);
+
+// ---------- queues ----------
+function addq(o, v, l, src) local(b)
+(
+  qn < QMAX ? (
+    b = Q + qn*4;
+    b[0] = o; b[1] = v; b[2] = l; b[3] = src;
+    qn += 1;
+  );
+);
+
+function addout(o, a, b2, c) local(b)
+(
+  on_n < OQMAX ? (
+    b = OQ + on_n*4;
+    b[0] = max(0, min(samplesblock - 1, floor(o)));
+    b[1] = a; b[2] = b2; b[3] = c;
+    on_n += 1;
+  );
+);
+
+// insertion sort of 4-wide records by first field (stable)
+function sort4(base, n) local(i, j, a0, a1, a2, a3, p)
+(
+  i = 1;
+  loop(max(0, n - 1),
+    p = base + i*4;
+    a0 = p[0]; a1 = p[1]; a2 = p[2]; a3 = p[3];
+    j = i - 1;
+    while (j >= 0 && base[j*4] > a0) (
+      p = base + j*4;
+      p[4] = p[0]; p[5] = p[1]; p[6] = p[2]; p[7] = p[3];
+      j -= 1;
+    );
+    p = base + (j + 1)*4;
+    p[0] = a0; p[1] = a1; p[2] = a2; p[3] = a3;
+    i += 1;
+  );
+);
+
+// ---------- voices ----------
+// stride 8: [0] active [1] pos [2] amp [3] inc [4] fade gain [5] fading
+function start_voice(vel) local(v, b, found)
+(
+  has_smp ? (
+    choke ? (
+      v = 0;
+      loop(NV, b = VOI + v*8; b[0] ? b[5] = 1; v += 1;);
+    );
+    found = -1; v = 0;
+    loop(NV, b = VOI + v*8; found < 0 && !b[0] ? found = v; v += 1;);
+    found < 0 ? ( found = vrr; vrr = (vrr + 1) % NV; );
+    b = VOI + found*8;
+    b[0] = 1; b[1] = 0;
+    b[2] = (vel / 127) ^ 1.3;
+    b[3] = smp_sr / srate * 2^(tune / 12);
+    b[4] = 1; b[5] = 0;
+    lastv = found;
+  );
+);
+
+// ---------- GUI helpers ----------
+function col(c) ( gfx_r = ((c >> 16) & 255) / 255; gfx_g = ((c >> 8) & 255) / 255; gfx_b = (c & 255) / 255; gfx_a = 1; );
+
+function rr(x, y, w, h, r)
+(
+  r = min(r, min(w, h) / 2);
+  r < 1.5 ? gfx_rect(x, y, w, h) : (
+    gfx_rect(x + r, y, w - 2*r, h);
+    gfx_rect(x, y + r, r, h - 2*r);
+    gfx_rect(x + w - r, y + r, r, h - 2*r);
+    gfx_circle(x + r, y + r, r, 1, 1);
+    gfx_circle(x + w - r - 1, y + r, r, 1, 1);
+    gfx_circle(x + r, y + h - r - 1, r, 1, 1);
+    gfx_circle(x + w - r - 1, y + h - r - 1, r, 1, 1);
+  );
+);
+
+function txt(x, y, s) ( gfx_x = x; gfx_y = y; gfx_drawstr(s); );
+function txt_r(x, y, s) local(w, h) ( gfx_measurestr(s, w, h); gfx_x = x - w; gfx_y = y; gfx_drawstr(s); );
+function txt_c(x, y, w, h, s) local(tw, th)
+(
+  gfx_measurestr(s, tw, th);
+  gfx_x = x + (w - tw) / 2; gfx_y = y + (h - th) / 2;
+  gfx_drawstr(s);
+);
+
+function hit(x, y, w, h) ( mouse_x >= x && mouse_x < x + w && mouse_y >= y && mouse_y < y + h; );
+
+function panel(x, y, w, h, title, dotc)
+(
+  col(C_PANEL); rr(x, y, w, h, 7);
+  gfx_setfont(1); col(C_LABEL); txt(x + 12, y + 9, title);
+  col(dotc); gfx_circle(x + w - 15, y + 15, 4, 1, 1);
+);
+
+// pill button: returns 1 when clicked
+function btn(x, y, w, h, label, fillc, hovc, textc) local(hv)
+(
+  hv = hit(x, y, w, h) && act == 0;
+  col(hv ? hovc : fillc); rr(x, y, w, h, h / 2);
+  gfx_setfont(5); col(textc); txt_c(x, y, w, h, label);
+  hv && mdown;
+);
+
+// ---- parameter access by index ----
+function getp(i)
+(
+  i == 1 ? run : (i == 2 ? seq : (i == 3 ? nsteps : (i == 4 ? rate : (i == 5 ? swing :
+  (i == 6 ? tune : (i == 7 ? decay : (i == 8 ? vol : (i == 9 ? density : (i == 10 ? variation :
+  (i == 11 ? rolls : (i == 12 ? note : (i == 13 ? midiout : (i == 14 ? choke : (i == 15 ? embed : 0))))))))))))));
+);
+
+function setp(i, v)
+(
+  i == 1 ? run = v;
+  i == 2 ? seq = v;
+  i == 3 ? nsteps = v;
+  i == 4 ? rate = v;
+  i == 5 ? swing = v;
+  i == 6 ? tune = v;
+  i == 7 ? decay = v;
+  i == 8 ? vol = v;
+  i == 9 ? density = v;
+  i == 10 ? variation = v;
+  i == 11 ? rolls = v;
+  i == 12 ? note = v;
+  i == 13 ? midiout = v;
+  i == 14 ? choke = v;
+  i == 15 ? embed = v;
+  slider_automate(2^(i - 1));
+  publish();
+);
+
+function notename(n) local(k, nm)
+(
+  k = n % 12;
+  nm = k == 0 ? "C" : (k == 1 ? "C#" : (k == 2 ? "D" : (k == 3 ? "D#" : (k == 4 ? "E" : (k == 5 ? "F" :
+       (k == 6 ? "F#" : (k == 7 ? "G" : (k == 8 ? "G#" : (k == 9 ? "A" : (k == 10 ? "A#" : "B"))))))))));
+  sprintf(#nn, "%s%d", nm, floor(n / 12) - 1);
+);
+
+function fmtp(i, v)
+(
+  i == 3 ? sprintf(#vs, "%d", v) :
+  i == 4 ? strcpy(#vs, v == 0 ? "1/4" : (v == 1 ? "1/8" : (v == 2 ? "1/8T" : (v == 3 ? "1/16" : (v == 4 ? "1/16T" : "1/32"))))) :
+  i == 6 ? ( v >= 0 ? sprintf(#vs, "+%.1f st", v) : sprintf(#vs, "%.1f st", v); ) :
+  i == 7 ? ( v >= 100 ? strcpy(#vs, "FULL") : ( sprintf(#vs, "%d", v); strcat(#vs, "%"); ); ) :
+  i == 8 ? ( v >= 0 ? sprintf(#vs, "+%.1f dB", v) : sprintf(#vs, "%.1f dB", v); ) :
+  i == 12 ? ( notename(v); sprintf(#vs, "%s  %d", #nn, v); ) :
+  ( sprintf(#vs, "%d", v); strcat(#vs, "%"); );
+);
+
+function qz(v, lo, hi, st) ( max(lo, min(hi, floor(v / st + 0.5) * st)); );
+
+// slim slider: label left, value right, thin line underneath
+function hsl(id, i, x, y, w, lo, hi, def, st, ws, org, ac, lab) local(v, hv, nval, t, t0, fine)
+(
+  v = getp(i);
+  hv = hit(x, y, w, 30);
+  mdown && hv && act == 0 ? (
+    (time_precise() - lastclick_t < 0.3 && lastclick_id == id) ? (
+      setp(i, def); v = def; lastclick_id = -1;
+    ) : (
+      act = id; dx0 = mouse_x; dv0 = v;
+      lastclick_t = time_precise(); lastclick_id = id;
+    );
+  );
+  act == id && (mouse_cap & 1) ? (
+    fine = (mouse_cap & 8) ? 0.15 : 1;
+    nval = qz(dv0 + (mouse_x - dx0) / w * (hi - lo) * fine, lo, hi, st);
+    nval != v ? ( setp(i, nval); v = nval; );
+  );
+  hv && act == 0 && mouse_wheel != 0 ? (
+    nval = qz(v + (mouse_wheel > 0 ? 1 : -1) * ws * ((mouse_cap & 8) ? 0.25 : 1), lo, hi, st);
+    nval != v ? ( setp(i, nval); v = nval; );
+    mouse_wheel = 0;
+  );
+  gfx_setfont(1); col(C_LABEL); txt(x, y + 1, lab);
+  fmtp(i, v);
+  gfx_setfont(5); col(C_TEXT); txt_r(x + w, y, #vs);
+  t = (v - lo) / (hi - lo);
+  t0 = (org - lo) / (hi - lo);
+  col(C_TRACK); gfx_rect(x, y + 21, w, 2);
+  col(ac); gfx_rect(x + min(t, t0) * w, y + 21, abs(t - t0) * w, 2);
+  col(act == id ? C_TEXT : ac); gfx_rect(x + t * w - 1, y + 16, 3, 12);
+);
+
+publish();
+
+@slider
+publish();
+
+@block
+need_load ? ( need_load = 0; load_sample(); );
+need_peaks ? ( need_peaks = 0; calc_peaks(); );
+
+spb = srate * 60 / tempo;            // samples per beat (QN)
+bl  = samplesblock / spb;            // block length in beats
+stl = steplen_of(rate);
+L   = nsteps * stl;
+swd = swing / 100 * 0.5 * stl;
+gain = 10^(vol / 20);
+fade_step = 1 / (0.004 * srate);
+dec_frames = decay < 100 ? decay / 100 * smp_frames : 0;
+dec_hold = dec_frames * 0.25;
+
+qn = 0; qi = 0; si = 0; on_n = 0;
+
+// incoming MIDI: pass through, note-ons play the sample
+while (midirecv(mo, m1, m2, m3)) (
+  addout(mo, m1, m2, m3);
+  ((m1 & 0xF0) == 0x90 && m3 > 0) ? addq(mo, m3, 0, 0);
+);
+
+// audition request from the GUI
+preview_req ? ( preview_req = 0; addq(0, 110, 0, 0); );
+
+// position
+playing = 0;
+run ? (
+  !was_run ? freepos = 0;
+  b0 = freepos;
+  freepos += bl;
+  playing = 1;
+) : (
+  (play_state & 1) ? (
+    b0 = (was_tplay && abs(beat_position - prev_b1) < 2 / spb) ? prev_b1 : beat_position;
+    playing = 1;
+  );
+);
+was_run = run;
+was_tplay = playing && !run;
+b1 = b0 + bl;
+prev_b1 = b1;
+
+playing ? (
+  x = b0 - floor(b0 / L) * L;
+  disp_step = floor(x / stl + 0.000001);
+  disp_step >= nsteps ? disp_step = nsteps - 1;
+) : disp_step = -1;
+disp_play = playing;
+
+// schedule pattern hits inside [b0, b1)
+playing && seq ? (
+  c = floor(b0 / L);
+  while (c * L < b1) (
+    s = 0;
+    loop(nsteps,
+      PON[s] ? (
+        r = max(1, PRAT[s]);
+        sub = stl / r;
+        base = c * L + s * stl + ((s & 1) ? swd : 0);
+        j = 0;
+        loop(r,
+          t = base + j * sub;
+          (t >= b0 && t < b1) ? addq(min(samplesblock - 1, floor((t - b0) * spb + 0.5)), PVEL[s], sub * spb * 0.5, 1);
+          j += 1;
+        );
+      );
+      s += 1;
+    );
+    c += 1;
+  );
+);
+
+sort4(Q, qn);
+
+// MIDI out for generated hits (one pitch: each new hit closes the previous note)
+k = 0;
+loop(qn,
+  qb = Q + k*4;
+  (qb[3] && midiout) ? (
+    pend_off ? ( addout(min(pend_ofs, qb[0]), 0x80, pend_note, 0); pend_off = 0; );
+    addout(qb[0], 0x90, note, max(1, min(127, qb[1])));
+    pend_off = 1; pend_note = note;
+    pend_ofs = qb[0] + max(0.001 * srate, qb[2]);
+  );
+  k += 1;
+);
+pend_off ? (
+  pend_ofs < samplesblock ? ( addout(pend_ofs, 0x80, pend_note, 0); pend_off = 0; ) : pend_ofs -= samplesblock;
+);
+
+sort4(OQ, on_n);
+k = 0;
+loop(on_n,
+  qb = OQ + k*4;
+  midisend(qb[0], qb[1], qb[2], qb[3]);
+  k += 1;
+);
+
+@sample
+while (qi < qn && Q[qi*4] <= si) (
+  start_voice(Q[qi*4 + 1]);
+  qi += 1;
+);
+si += 1;
+
+has_smp ? (
+  oL = 0; oR = 0;
+  v = 0;
+  loop(NV,
+    vb = VOI + v*8;
+    vb[0] ? (
+      p = vb[1];
+      ip = floor(p);
+      ip < smp_frames - 1 ? (
+        fr = p - ip;
+        smp_nch == 2 ? (
+          a = SMP + ip*2;
+          ssL = a[0] + (a[2] - a[0]) * fr;
+          ssR = a[1] + (a[3] - a[1]) * fr;
+        ) : (
+          a = SMP + ip;
+          ssL = a[0] + (a[1] - a[0]) * fr;
+          ssR = ssL;
+        );
+        gn = vb[2] * vb[4];
+        dec_frames > 0 ? (
+          ip > dec_hold ? (
+            e = 1 - (ip - dec_hold) / max(1, dec_frames - dec_hold);
+            e = max(0, e);
+            gn *= e * e;
+          );
+          ip >= dec_frames ? vb[0] = 0;
+        );
+        oL += ssL * gn;
+        oR += ssR * gn;
+        vb[1] = p + vb[3];
+        vb[5] ? (
+          vb[4] -= fade_step;
+          vb[4] <= 0 ? vb[0] = 0;
+        );
+      ) : vb[0] = 0;
+    );
+    v += 1;
+  );
+  spl0 += oL * gain;
+  spl1 += oR * gain;
+);
+
+@serialize
+ser_w = file_avail(0) < 0;
+ser_ver = 1;
+file_var(0, ser_ver);
+ser_w ? (
+  ser_emb = (embed && has_smp) ? 1 : 0;
+  ser_frames = smp_frames; ser_nch = smp_nch; ser_sr = smp_sr;
+);
+file_var(0, ser_emb);
+file_var(0, ser_frames);
+file_var(0, ser_nch);
+file_var(0, ser_sr);
+file_string(0, #path);
+file_mem(0, PON, 96);
+(ser_emb && ser_frames > 0) ? file_mem(0, SMP, ser_frames * ser_nch);
+!ser_w ? (
+  (ser_emb && ser_frames > 0) ? (
+    memset(VOI, 0, NV*8);
+    smp_frames = ser_frames; smp_nch = ser_nch; smp_sr = ser_sr;
+    has_smp = 1; need_peaks = 1;
+    basename();
+  ) : (
+    has_smp = 0;
+    strlen(#path) > 0 ? need_load = 1;
+  );
+  publish();
+);
+
+@gfx 960 392
+// ================= GUI =================
+gfx_setfont(1, "Consolas", 12);
+gfx_setfont(2, "Consolas", 25, 'b');
+gfx_setfont(3, "Consolas", 14, 'b');
+gfx_setfont(4, "Consolas", 11);
+gfx_setfont(5, "Consolas", 13, 'b');
+
+// ---- frame setup ----
+now = time_precise();
+mdown = (mouse_cap & 1) && !(last_cap & 1);
+mup = !(mouse_cap & 1) && (last_cap & 1);
+rdown = (mouse_cap & 2) && !(last_cap & 2);
+(mdown || rdown) ? publish();   // the instance you touch is the one the MIDI script reads
+
+// file drop anywhere on the window
+gfx_getdropfile(0, #drop) ? (
+  strcpy(#path, #drop);
+  need_load = 1;
+  gfx_getdropfile(-1);
+);
+
+W = gfx_w; H = gfx_h; G = 6;
+col(C_BG); gfx_rect(0, 0, W, H);
+
+h1 = 64; h3 = 128;
+y1 = G;
+y2 = y1 + h1 + G;
+h2 = max(140, H - y2 - G - h3 - G);
+y3 = y2 + h2 + G;
+
+// ================= ROW 1 =================
+titleW = 220; trW = 190;
+rem = W - 2*G - titleW - trW - 3*G;
+patW = floor(rem / 2); rndW = rem - patW;
+xT = G; xTr = xT + titleW + G; xP = xTr + trW + G; xR = xP + patW + G;
+
+// --- title ---
+col(C_PANEL); rr(xT, y1, titleW, h1, 7);
+gfx_setfont(2); col(C_TEXT); txt(xT + 14, y1 + 9, "HATS");
+gfx_measurestr("HATS", tw_, th_);
+col(C_OR); txt(xT + 14 + tw_, y1 + 9, "OFF");
+gfx_setfont(4); col(C_LABEL); txt(xT + 15, y1 + 41, "HI-HAT PATTERN SAMPLER");
+
+// status pill
+(now - load_err_t < 4) ? ( stc = C_RED; strcpy(#st, "LOAD FAILED"); ) :
+(!has_smp && strlen(#path) > 0) ? ( stc = C_RED; strcpy(#st, "FILE MISSING"); ) :
+!has_smp ? ( stc = C_OR; strcpy(#st, "NO SAMPLE"); ) :
+(disp_play && seq) ? ( stc = C_TE; strcpy(#st, run ? "RUNNING" : "PLAYING"); ) :
+( stc = C_LABEL; strcpy(#st, "READY"); );
+gfx_setfont(4); gfx_measurestr(#st, sw_, sh_);
+pw_ = sw_ + 18;
+col(stc); rr(xT + titleW - 12 - pw_, y1 + 10, pw_, 18, 9);
+col(C_WHITE); txt_c(xT + titleW - 12 - pw_, y1 + 10, pw_, 18, #st);
+
+// --- transport ---
+panel(xTr, y1, trW, h1, "TRANSPORT", C_OR);
+bx_ = xTr + 12; by_ = y1 + 28;
+btn(bx_, by_, 96, 26, "", run ? C_OR : C_INSET, run ? 0xD94E1C : C_INSET2, C_WHITE) ? setp(1, !run);
+gfx_setfont(3); col(run ? C_WHITE : C_OR); txt(bx_ + 22, by_ + 5, "RUN");
+gfx_triangle(bx_ + 62, by_ + 7, bx_ + 62, by_ + 19, bx_ + 72, by_ + 13);
+btn(bx_ + 104, by_, trW - 128, 26, "SEQ", seq ? C_TE : C_INSET, seq ? 0x267C78 : C_INSET2, seq ? C_WHITE : C_LABEL) ? setp(2, !seq);
+
+// --- pattern ---
+panel(xP, y1, patW, h1, "PATTERN", C_BL);
+bw_ = (patW - 24 - 12) / 3;
+btn(xP + 12, by_, bw_ * 1.2, 26, "GENERATE", C_BL, 0x2F519C, C_WHITE) ? do_generate();
+btn(xP + 18 + bw_ * 1.2, by_, bw_ * 0.9, 26, "CLEAR", C_INSET, C_INSET2, C_RED) ? do_clear();
+btn(xP + 24 + bw_ * 2.1, by_, bw_ * 0.9, 26, "UNDO", C_INSET, C_INSET2, has_undo ? C_TEXT : 0x8A8A86) ? do_undo();
+
+// --- randomize ---
+panel(xR, y1, rndW, h1, "RANDOMIZE", C_PU);
+bw_ = (rndW - 24 - 12) / 3;
+btn(xR + 12, by_, bw_, 26, "NOTES", C_INSET, C_PUL, C_PU) ? do_rand_notes();
+btn(xR + 18 + bw_, by_, bw_, 26, "VELOCITY", C_INSET, C_PUL, C_PU) ? do_rand_vel();
+btn(xR + 24 + bw_ * 2, by_, bw_, 26, "ALL", C_INSET, C_PUL, C_PU) ? do_rand_all();
+
+// ================= ROW 2 =================
+wvW = 240;
+xW = G; xS = xW + wvW + G; stW = W - xS - G;
+
+// --- sample / waveform ---
+panel(xW, y2, wvW, h2, "SAMPLE", C_TE);
+btn(xW + wvW - 32 - 62, y2 + 7, 62, 17, "", embed ? C_TE : C_INSET, embed ? 0x267C78 : C_INSET2, C_WHITE) ? setp(15, !embed);
+gfx_setfont(4); col(embed ? C_WHITE : C_LABEL); txt_c(xW + wvW - 32 - 62, y2 + 7, 62, 17, "EMBED");
+
+wx = xW + 12; wy = y2 + 30; ww = wvW - 24; wh = h2 - 30 - 30;
+whov = hit(wx, wy, ww, wh);
+col(whov && has_smp ? C_INSET2 : C_INSET); rr(wx, wy, ww, wh, 5);
+has_smp ? (
+  cy = wy + wh / 2;
+  col(C_TRACK); gfx_rect(wx + 6, cy, ww - 12, 1);
+  col(C_TEXT);
+  px = 0;
+  loop(ww - 12,
+    pkv = PK[floor(px / (ww - 12) * NPK)] / pk_max;
+    ph_ = max(0.5, pkv * (wh / 2 - 6));
+    gfx_rect(wx + 6 + px, cy - ph_, 1, ph_ * 2 + 1);
+    px += 1;
+  );
+  // playhead of the latest voice
+  vb_ = VOI + lastv * 8;
+  vb_[0] ? (
+    col(C_OR);
+    gfx_rect(wx + 6 + min(1, vb_[1] / smp_frames) * (ww - 12), wy + 4, 2, wh - 8);
+  );
+  mdown && whov && act == 0 ? preview_req = 1;
+  // file name + length
+  gfx_setfont(4); col(C_TEXT);
+  sprintf(#len, "%d ms", floor(smp_frames / smp_sr * 1000 + 0.5));
+  gfx_measurestr(#len, lw_, lh_);
+  strcpy(#fn, #fname);
+  maxc = floor((ww - lw_ - 14) / 6.2);
+  strlen(#fn) > maxc ? ( strcpy_substr(#fn, #fname, 0, max(1, maxc - 2)); strcat(#fn, ".."); );
+  txt(wx + 2, wy + wh + 9, #fn);
+  col(C_LABEL); txt_r(wx + ww - 2, wy + wh + 9, #len);
+) : (
+  gfx_setfont(5); col(C_LABEL); txt_c(wx, wy + wh/2 - 18, ww, 20, "DROP A SAMPLE HERE");
+  gfx_setfont(4); txt_c(wx, wy + wh/2 + 2, ww, 16, "WAV  AIF  FLAC  MP3  OGG");
+  strlen(#path) > 0 ? ( col(C_RED); txt(wx + 2, wy + wh + 9, "previous file not found"); );
+);
+
+// --- steps ---
+stl_g = steplen_of(rate);
+sprintf(#hd, "STEPS  %d x ", nsteps); fmtp(4, rate); strcat(#hd, #vs);
+panel(xS, y2, stW, h2, #hd, C_GR);
+gfx_setfont(4); col(C_LABEL);
+txt_r(xS + stW - 30, y2 + 10, "CLICK ON/OFF   DRAG UP/DOWN = VELOCITY   RIGHT-CLICK = ROLL");
+
+sx = xS + 12; sw = stW - 24; sy = y2 + 34;
+sbh = h2 - 34 - 46;
+numY = sy + sbh + 3; ratY = numY + 15; ratH = 16;
+n = nsteps; gap = n > 16 ? 3 : 5;
+bw = (sw - gap * (n - 1)) / n;
+
+hs = -1;
+(mouse_x >= sx && mouse_x < sx + sw) ? hs = max(0, min(n - 1, floor((mouse_x - sx) / (bw + gap))));
+inbars = hs >= 0 && mouse_y >= sy - 4 && mouse_y < sy + sbh;
+inrat = hs >= 0 && mouse_y >= ratY && mouse_y < ratY + ratH;
+
+// --- step interaction ---
+mdown && act == 0 && inbars ? (
+  !PON[hs] ? (
+    PON[hs] = 1; PVEL[hs] < 1 ? PVEL[hs] = 100;
+    act = 200; pat_changed();
+  ) : (
+    act = 201; ds = hs; dy0 = mouse_y; dv0 = PVEL[hs]; dmoved = 0;
+  );
+);
+(mdown && act == 0 && inrat) || (rdown && act == 0 && inbars) ? (
+  PRAT[hs] = PRAT[hs] >= 4 ? 1 : PRAT[hs] + 1;
+  !PON[hs] ? PON[hs] = 1;
+  pat_changed();
+);
+act == 200 && (mouse_cap & 1) && hs >= 0 && !PON[hs] ? ( PON[hs] = 1; pat_changed(); );
+act == 202 && (mouse_cap & 1) && hs >= 0 && PON[hs] ? ( PON[hs] = 0; pat_changed(); );
+act == 201 && (mouse_cap & 1) ? (
+  !dmoved ? (
+    abs(mouse_y - dy0) > 3 ? dmoved = 1 : (
+      (hs >= 0 && hs != ds) ? ( act = 202; PON[ds] = 0; PON[hs] = 0; pat_changed(); );
+    );
+  );
+  (dmoved && act == 201) ? (
+    nv_ = dv0 + (dy0 - mouse_y) * 127 / sbh * ((mouse_cap & 8) ? 0.25 : 1);
+    nv_ = max(1, min(127, floor(nv_ + 0.5)));
+    nv_ != PVEL[ds] ? ( PVEL[ds] = nv_; pat_changed(); );
+  );
+);
+act == 201 && mup && !dmoved ? ( PON[ds] = 0; pat_changed(); );
+inbars && act == 0 && mouse_wheel != 0 && PON[hs] ? (
+  PVEL[hs] = max(1, min(127, PVEL[hs] + (mouse_wheel > 0 ? 1 : -1) * ((mouse_cap & 8) ? 1 : 5)));
+  mouse_wheel = 0;
+  pat_changed();
+);
+
+// --- step drawing ---
+i = 0;
+loop(n,
+  bx = sx + i * (bw + gap);
+  cl = cls_of(i);
+  PON[i] ? (
+    col(C_GRL); rr(bx, sy, bw, sbh, 5);
+    fh = max(3, PVEL[i] / 127 * sbh);
+    col((i == disp_step && seq) ? C_GRH : C_GR);
+    rr(bx, sy + sbh - fh, bw, fh, min(5, fh / 2));
+  ) : (
+    col(cl == 0 ? C_INSET2 : C_INSET); rr(bx, sy, bw, sbh, 5);
+  );
+  (i == hs && inbars && act != 202) || (act == 201 && i == ds) ? (
+    PON[i] ? (
+      gfx_setfont(4); col(C_TEXT); sprintf(#vv, "%d", PVEL[i]);
+      txt_c(bx, sy + 4, bw, 12, #vv);
+    ) : (
+      col(C_TRACK); rr(bx + 2, sy + 2, bw - 4, sbh - 4, 4);
+    );
+  );
+  i == disp_step ? ( col(C_TEXT); rr(bx, sy - 6, bw, 3, 1); );
+  cl == 0 ? (
+    gfx_setfont(4); col(C_LABEL);
+    sprintf(#bn, "%d", floor(i * stl_g + 0.001) + 1);
+    txt_c(bx, numY, bw, 12, #bn);
+  );
+  PRAT[i] > 1 ? (
+    col(PON[i] ? C_PU : C_PUL); rr(bx, ratY, bw, ratH, 4);
+    gfx_setfont(4); col(C_WHITE); sprintf(#rv, "x%d", PRAT[i]);
+    txt_c(bx, ratY, bw, ratH, #rv);
+  ) : (
+    col((inrat && i == hs) ? C_INSET2 : C_INSET); rr(bx, ratY, bw, ratH, 4);
+  );
+  i += 1;
+);
+
+// ================= ROW 3 =================
+pw = floor((W - 2*G - 3*G) / 4);
+x0 = G; xa = x0 + 14; sl_w = pw - 28;
+
+panel(x0, y3, pw, h3, "SOUND", C_OR);
+hsl(106, 6, xa, y3 + 30, sl_w, -24, 24, 0, 0.1, 1, 0, C_OR, "TUNE");
+hsl(107, 7, xa, y3 + 62, sl_w, 5, 100, 100, 1, 2, 5, C_OR, "DECAY");
+hsl(108, 8, xa, y3 + 94, sl_w, -36, 6, 0, 0.1, 0.5, -36, C_OR, "VOLUME");
+
+x0 += pw + G; xa = x0 + 14;
+panel(x0, y3, pw, h3, "GROOVE", C_BL);
+hsl(103, 3, xa, y3 + 30, sl_w, 1, 32, 16, 1, 1, 1, C_BL, "STEPS");
+hsl(104, 4, xa, y3 + 62, sl_w, 0, 5, 3, 1, 1, 0, C_BL, "RATE");
+hsl(105, 5, xa, y3 + 94, sl_w, 0, 100, 0, 1, 2, 0, C_BL, "SWING");
+
+x0 += pw + G; xa = x0 + 14;
+panel(x0, y3, pw, h3, "GENERATOR", C_PU);
+hsl(109, 9, xa, y3 + 30, sl_w, 0, 100, 50, 1, 2, 0, C_PU, "DENSITY");
+hsl(110, 10, xa, y3 + 62, sl_w, 0, 100, 40, 1, 2, 0, C_PU, "VEL VARIATION");
+hsl(111, 11, xa, y3 + 94, sl_w, 0, 100, 20, 1, 2, 0, C_PU, "ROLLS");
+
+x0 += pw + G; xa = x0 + 14;
+lpw = W - G - x0;
+panel(x0, y3, lpw, h3, "OUTPUT", C_TE);
+hsl(112, 12, xa, y3 + 30, lpw - 28, 0, 127, 42, 1, 1, 0, C_TE, "MIDI NOTE");
+hb_ = (lpw - 28 - 8) / 2;
+btn(xa, y3 + 66, hb_, 24, "MIDI OUT", midiout ? C_TE : C_INSET, midiout ? 0x267C78 : C_INSET2, midiout ? C_WHITE : C_LABEL) ? setp(13, !midiout);
+btn(xa + hb_ + 8, y3 + 66, hb_, 24, "CHOKE", choke ? C_TE : C_INSET, choke ? 0x267C78 : C_INSET2, choke ? C_WHITE : C_LABEL) ? setp(14, !choke);
+gfx_setfont(4); col(C_LABEL);
+txt(xa, y3 + 101, has_smp && embed ? "SAMPLE SAVED IN PROJECT" : (has_smp ? "SAMPLE LINKED BY PATH" : "MIDI IN PLAYS THE SAMPLE"));
+
+// ---- end of frame ----
+(mup || !(mouse_cap & 3)) ? act = 0;
+mouse_wheel = 0;
+last_cap = mouse_cap;
