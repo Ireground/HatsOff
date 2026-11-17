@@ -20,4 +20,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: HatsOff-VST3-Windows
-          path: build/HatsOff_artefacts/Release/VST3/
+          path: build/HatsOff_artefacts/Release/VST3/*.vst3
