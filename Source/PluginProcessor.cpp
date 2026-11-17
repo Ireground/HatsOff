@@ -259,26 +259,40 @@ std::shared_ptr<const HatsOffProcessor::Sample> HatsOffProcessor::makeSample (ju
     return s;
 }
 
-bool HatsOffProcessor::readFile (const juce::File& f, juce::AudioBuffer<float>& dest, double& rate, juce::String& error)
+bool HatsOffProcessor::readFile (const juce::File& f, juce::AudioBuffer<float>& dest, double& rate, juce::String& error,
+                                 double startSec, double lengthSec)
 {
     if (! f.existsAsFile()) { error = "File not found"; return false; }
     std::unique_ptr<juce::AudioFormatReader> r (formats.createReaderFor (f));
     if (r == nullptr) { error = "Unsupported audio format"; return false; }
     if (r->lengthInSamples <= 0 || r->sampleRate <= 0) { error = "File is empty"; return false; }
 
-    const int len = (int) std::min<juce::int64> (r->lengthInSamples, (juce::int64) (maxSampleSeconds * r->sampleRate));
+    const juce::int64 total = r->lengthInSamples;
+    const juce::int64 first = juce::jlimit ((juce::int64) 0, total - 1, (juce::int64) std::llround (startSec * r->sampleRate));
+    juce::int64 count = lengthSec > 0.0 ? (juce::int64) std::llround (lengthSec * r->sampleRate) : total - first;
+    count = std::min (count, total - first);
+    if (count < 16) { error = "Clip is too short"; return false; }
+    const int len = (int) std::min<juce::int64> (count, (juce::int64) (maxSampleSeconds * r->sampleRate));
     const int ch = (int) juce::jlimit (1u, 2u, r->numChannels);
     dest.setSize (ch, len);
-    r->read (&dest, 0, len, 0, true, ch > 1);
+    r->read (&dest, 0, len, first, true, ch > 1);
     rate = r->sampleRate;
     return true;
 }
 
-bool HatsOffProcessor::loadFile (const juce::File& file, juce::String& error)
+bool HatsOffProcessor::importFromArrange (juce::String& error)
+{
+    ReaperBridge::ArrangeItem item;
+    if (! reaper.getSelectedAudioItem (item, error)) return false;
+    return loadFile (item.file, error, item.startSec, item.lengthSec, item.name);
+}
+
+bool HatsOffProcessor::loadFile (const juce::File& file, juce::String& error,
+                                 double startSec, double lengthSec, const juce::String& displayName)
 {
     juce::AudioBuffer<float> buf;
     double rate = 44100.0;
-    if (! readFile (file, buf, rate, error))
+    if (! readFile (file, buf, rate, error, startSec, lengthSec))
     {
         loadErrorTime = juce::Time::getMillisecondCounterHiRes() / 1000.0;
         return false;
@@ -288,8 +302,10 @@ bool HatsOffProcessor::loadFile (const juce::File& file, juce::String& error)
     std::atomic_store (&sample, s);
     {
         const juce::ScopedLock sl (nameLock);
-        sampleName = file.getFileName();
+        sampleName = displayName.isNotEmpty() ? displayName : file.getFileName();
         samplePath = file.getFullPathName();
+        rangeStart = startSec;
+        rangeLength = lengthSec;
     }
     missing = false;
     return true;
@@ -381,6 +397,8 @@ void HatsOffProcessor::getStateInformation (juce::MemoryBlock& destData)
         const juce::ScopedLock sl (nameLock);
         smp->setAttribute ("name", sampleName);
         smp->setAttribute ("path", samplePath);
+        smp->setAttribute ("rangeStart", rangeStart);
+        smp->setAttribute ("rangeLength", rangeLength);
     }
     // Embedding: only the current sample is written, so loading a new one replaces the old one in the project.
     if (param ("embed") > 0.5f)
@@ -417,6 +435,8 @@ void HatsOffProcessor::setStateInformation (const void* data, int sizeInBytes)
             const juce::ScopedLock sl (nameLock);
             sampleName = smp->getStringAttribute ("name");
             samplePath = smp->getStringAttribute ("path");
+            rangeStart = smp->getDoubleAttribute ("rangeStart");
+            rangeLength = smp->getDoubleAttribute ("rangeLength");
         }
         bool ok = false;
         const auto text = smp->getAllSubText().trim();
@@ -429,7 +449,7 @@ void HatsOffProcessor::setStateInformation (const void* data, int sizeInBytes)
             juce::AudioBuffer<float> buf;
             double rate = 44100.0;
             juce::String err;
-            if (readFile (juce::File (path), buf, rate, err))
+            if (readFile (juce::File (path), buf, rate, err, rangeStart, rangeLength))
             {
                 auto s = makeSample (std::move (buf), rate);
                 if (sample != nullptr) retired.push_back (sample);

@@ -4,8 +4,10 @@
 #include <atomic>
 #include <memory>
 #include <vector>
+#include "ReaperBridge.h"
 
-class HatsOffProcessor : public juce::AudioProcessor
+class HatsOffProcessor : public juce::AudioProcessor,
+                         public juce::VST3ClientExtensions
 {
 public:
     static constexpr int MaxSteps = 32;
@@ -37,6 +39,12 @@ public:
     void getStateInformation (juce::MemoryBlock&) override;
     void setStateInformation (const void*, int) override;
 
+    // ---- REAPER ----
+    juce::VST3ClientExtensions* getVST3ClientExtensions() override { return this; }
+    void setIHostApplication (Steinberg::FUnknown* host) override { reaper.setHostContext (host); }
+    bool isInReaper() const noexcept { return reaper.isReaper(); }
+    bool importFromArrange (juce::String& error);   // selected timeline item -> sample
+
     // ---- parameters ----
     juce::AudioProcessorValueTreeState apvts;
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
@@ -64,7 +72,8 @@ public:
         std::array<float, NumPeaks> peaks {};
         float peakMax = 1.0f;
     };
-    bool loadFile (const juce::File& file, juce::String& error);
+    bool loadFile (const juce::File& file, juce::String& error,
+                   double startSec = 0.0, double lengthSec = 0.0, const juce::String& displayName = {});
     std::shared_ptr<const Sample> getSample() const { return std::atomic_load (&sample); }
     juce::String getSampleName() const;
     bool isSampleMissing() const { return missing.load(); }
@@ -99,11 +108,14 @@ private:
     std::vector<std::shared_ptr<const Sample>> retired;
     juce::AudioFormatManager formats;
     juce::String sampleName, samplePath;
+    double rangeStart = 0.0, rangeLength = 0.0;   // part of the file used (seconds); 0 length = whole
+    ReaperBridge reaper;
     mutable juce::CriticalSection nameLock;
     std::atomic<bool> missing { false };
     std::atomic<double> loadErrorTime { -100.0 };
     std::shared_ptr<const Sample> makeSample (juce::AudioBuffer<float>&& audio, double rate) const;
-    bool readFile (const juce::File& f, juce::AudioBuffer<float>& dest, double& rate, juce::String& error);
+    bool readFile (const juce::File& f, juce::AudioBuffer<float>& dest, double& rate, juce::String& error,
+                   double startSec = 0.0, double lengthSec = 0.0);
     juce::String encodeSample() const;
     bool decodeSample (const juce::String& base64);
 

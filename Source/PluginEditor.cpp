@@ -27,7 +27,12 @@ namespace
 
     juce::Font mono (float size, bool bold = false)
     {
-        return juce::Font (juce::FontOptions ("Consolas", size, bold ? juce::Font::bold : juce::Font::plain));
+       #if JUCE_WINDOWS
+        const juce::String name ("Consolas");
+       #else
+        const juce::String name (juce::Font::getDefaultMonospacedFontName());
+       #endif
+        return juce::Font (juce::FontOptions (name, size, bold ? juce::Font::bold : juce::Font::plain));
     }
 
     double nowSeconds() { return juce::Time::getMillisecondCounterHiRes() / 1000.0; }
@@ -100,7 +105,8 @@ void HatsOffEditor::layout()
     const float wvW = 240.0f;
     pSample = R (G, y2, wvW, h2);
     pSteps  = R (G + wvW + G, y2, W - 2 * G - wvW - G, h2);
-    bEmbed  = R (pSample.getRight() - 32 - 62, y2 + 7, 62, 17);
+    bEmbed   = R (pSample.getRight() - 32 - 52, y2 + 7, 52, 17);
+    bArrange = R (bEmbed.getX() - 6 - 86, y2 + 7, 86, 17);
     waveRect = R (pSample.getX() + 12, y2 + 30, wvW - 24, h2 - 60);
 
     sx = pSteps.getX() + 12;
@@ -162,7 +168,7 @@ juce::Rectangle<float> HatsOffEditor::buttonRect (Kind k) const
         case BtnGen: return bGen;       case BtnClear: return bClear;   case BtnUndo: return bUndo;
         case BtnRNotes: return bRN;     case BtnRVel: return bRV;       case BtnRAll: return bRA;
         case BtnDrag: return bDrag;     case BtnDragLen: return bDragLen;
-        case BtnEmbed: return bEmbed;   case BtnMidiOut: return bMidiOut; case BtnChoke: return bChoke;
+        case BtnEmbed: return bEmbed;   case BtnArrange: return bArrange;   case BtnMidiOut: return bMidiOut; case BtnChoke: return bChoke;
         case Wave: return waveRect;
         case None: case StepBar: case StepRoll: case Slider: default: return {};
     }
@@ -171,7 +177,7 @@ juce::Rectangle<float> HatsOffEditor::buttonRect (Kind k) const
 HatsOffEditor::Target HatsOffEditor::findTarget (juce::Point<float> p) const
 {
     for (auto k : { BtnRun, BtnSeq, BtnGen, BtnClear, BtnUndo, BtnRNotes, BtnRVel, BtnRAll,
-                    BtnDrag, BtnDragLen, BtnEmbed, BtnMidiOut, BtnChoke, Wave })
+                    BtnDrag, BtnDragLen, BtnEmbed, BtnArrange, BtnMidiOut, BtnChoke, Wave })
         if (buttonRect (k).contains (p)) return { k, -1 };
 
     for (int i = 0; i < (int) sliders.size(); ++i)
@@ -280,7 +286,8 @@ void HatsOffEditor::paint (juce::Graphics& g)
     g.drawText ("HI-HAT PATTERN SAMPLER", pTitle.getX() + 15, pTitle.getY() + 41, pTitle.getWidth() - 20, 14, juce::Justification::centredLeft);
 
     juce::String st; juce::Colour stc;
-    if (nowSeconds() - proc.getLoadErrorTime() < 4.0)      { st = "LOAD FAILED";  stc = cRed; }
+    if (nowSeconds() - messageTime < 4.0)                   { st = message;        stc = cRed; }
+    else if (nowSeconds() - proc.getLoadErrorTime() < 4.0) { st = "LOAD FAILED";  stc = cRed; }
     else if (! hasSmp && proc.isSampleMissing())            { st = "FILE MISSING"; stc = cRed; }
     else if (! hasSmp)                                      { st = "NO SAMPLE";    stc = cOrange; }
     else if (proc.displayPlaying.load() && seq)             { st = run ? "RUNNING" : "PLAYING"; stc = cTeal; }
@@ -338,6 +345,8 @@ void HatsOffEditor::paint (juce::Graphics& g)
     drawPanel (g, pSample, "SAMPLE", cTeal);
     drawPill (g, bEmbed, "EMBED", embed ? (hov (BtnEmbed) ? cTealHov : cTeal) : (hov (BtnEmbed) ? cInset2 : cInset),
               embed ? juce::Colours::white : cLabel, 11.0f);
+    drawPill (g, bArrange, "FROM ARRANGE", ! proc.isInReaper() ? cInset : (hov (BtnArrange) ? cTealHov : cTeal),
+              proc.isInReaper() ? juce::Colours::white : cLabel, 11.0f);
     g.setColour ((hov (Wave) && hasSmp) || fileHover ? cInset2 : cInset);
     g.fillRoundedRectangle (waveRect, 5.0f);
     if (fileHover)
@@ -507,6 +516,16 @@ void HatsOffEditor::mouseDown (const juce::MouseEvent& e)
         case BtnRun:     toggle ("run"); break;
         case BtnSeq:     toggle ("seq"); break;
         case BtnEmbed:   toggle ("embed"); break;
+        case BtnArrange:
+        {
+            juce::String err;
+            if (! proc.importFromArrange (err))
+            {
+                message = err.length() <= 10 ? err.toUpperCase() : juce::String ("FAILED");
+                messageTime = nowSeconds();
+            }
+            break;
+        }
         case BtnMidiOut: toggle ("midiout"); break;
         case BtnChoke:   toggle ("choke"); break;
         case BtnGen:     proc.generate(); break;

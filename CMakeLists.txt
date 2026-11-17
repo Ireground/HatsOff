@@ -33,7 +33,12 @@ juce_generate_juce_header(HatsOff)
 
 target_sources(HatsOff PRIVATE
     Source/PluginProcessor.cpp
-    Source/PluginEditor.cpp)
+    Source/PluginEditor.cpp
+    Source/ReaperBridge.cpp)
+
+# REAPER extension interface (Steinberg headers shipped with JUCE)
+target_include_directories(HatsOff PRIVATE
+    ${juce_SOURCE_DIR}/modules/juce_audio_processors/format_types/VST3_SDK)
 
 target_compile_definitions(HatsOff PUBLIC
     JUCE_WEB_BROWSER=0

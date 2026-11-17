@@ -28,7 +28,7 @@ private:
     void timerCallback() override { repaint(); }
 
     enum Kind { None, BtnRun, BtnSeq, BtnGen, BtnClear, BtnUndo, BtnRNotes, BtnRVel, BtnRAll,
-                BtnDrag, BtnDragLen, BtnEmbed, BtnMidiOut, BtnChoke, Wave, StepBar, StepRoll, Slider };
+                BtnDrag, BtnDragLen, BtnEmbed, BtnArrange, BtnMidiOut, BtnChoke, Wave, StepBar, StepRoll, Slider };
     struct Target { Kind kind = None; int index = -1; };
 
     struct SliderDef
@@ -57,7 +57,7 @@ private:
     HatsOffProcessor& proc;
 
     juce::Rectangle<float> pTitle, pTransport, pPattern, pRandom, pClip, pSample, pSteps, pSound, pGroove, pGen, pOut;
-    juce::Rectangle<float> bRun, bSeq, bGen, bClear, bUndo, bRN, bRV, bRA, bDrag, bDragLen, bEmbed, bMidiOut, bChoke, waveRect;
+    juce::Rectangle<float> bRun, bSeq, bGen, bClear, bUndo, bRN, bRV, bRA, bDrag, bDragLen, bEmbed, bArrange, bMidiOut, bChoke, waveRect;
     float sx = 0, sy = 0, sw = 0, sbh = 0, numY = 0, rollY = 0;
     static constexpr float rollH = 16.0f;
     std::array<SliderDef, 10> sliders;
@@ -68,6 +68,8 @@ private:
     int stepMode = 0, dragStep = -1, dragStartY = 0, dragStartVel = 0;
     bool stepMoved = false, midiDragging = false, fileHover = false;
     juce::Point<float> mousePos { -1.0f, -1.0f };
+    juce::String message;
+    double messageTime = -100.0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (HatsOffEditor)
 };
